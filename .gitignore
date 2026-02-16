@@ -45,7 +45,6 @@ Thumbs.db
 uploads/
 infrastructure/postgres_data/
 task.md
-diagram.md
 
 # Docker
 .docker/
