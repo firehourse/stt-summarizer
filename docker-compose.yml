@@ -1,0 +1,134 @@
+name: stt-ai-prod  # define project name
+
+networks:
+  stt-network:
+    driver: bridge
+services:
+  # --- Infrastructure ---
+
+  postgres:
+    image: postgres:15-alpine
+    networks:
+      - stt-network
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    networks:
+      - stt-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    networks:
+      - stt-network
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+    ports:
+      - "15673:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # --- Application Services ---
+
+  gateway:
+    build: ./gateway
+    networks:
+      - stt-network
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      API_SERVICE_URL: http://api-service:3000
+      GATEWAY_PORT: 8081
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: on-failure
+
+  api-service:
+    build: ./api-service
+    networks:
+      - stt-network
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      REDIS_HOST: redis
+      RABBITMQ_HOST: rabbitmq
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - uploads:/app/uploads
+    restart: on-failure
+
+  worker:
+    build: ./worker
+    networks:  
+      - stt-network
+    env_file: .env
+    environment:
+      DB_HOST: postgres
+      REDIS_HOST: redis
+      RABBITMQ_HOST: rabbitmq
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - uploads:/app/uploads
+    restart: on-failure
+
+  frontend:
+    build:
+      context: ./webapp-vue
+      dockerfile: Dockerfile
+    networks:
+      - stt-network
+    depends_on:
+      - gateway
+
+  # --- Load Balancer (simulates cloud ALB) ---
+
+  nginx:
+    image: nginx:stable-alpine
+    networks:
+      - stt-network
+    ports:
+      - "8090:80"
+    volumes:
+      - ./infrastructure/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - frontend
+      - gateway
+
+volumes:
+  postgres_data:
+  uploads:
