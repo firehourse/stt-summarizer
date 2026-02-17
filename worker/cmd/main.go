@@ -63,6 +63,7 @@ func main() {
 		llmModel := os.Getenv("AI_LLM_MODEL")
 		sttKey := os.Getenv("AI_STT_KEY")
 		llmKey := os.Getenv("AI_LLM_KEY")
+		llmPrompt := os.Getenv("AI_LLM_PROMPT")
 
 		// URL 與 Model 是絕對必要的配置
 		if sttURL == "" || llmURL == "" || sttModel == "" || llmModel == "" {
@@ -76,6 +77,7 @@ func main() {
 			LLMApiKey: llmKey,
 			LLMURL:    llmURL,
 			LLMModel:  llmModel,
+			LLMPrompt: llmPrompt,
 		}
 		sttSvc = provider
 		llmSvc = provider

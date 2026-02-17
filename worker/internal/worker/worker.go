@@ -214,7 +214,7 @@ func (w *Worker) handleSummary(ctx context.Context, payload models.TaskPayload) 
 
 	var summaryBuffer strings.Builder
 
-	err := w.LLM.SummarizeStream(ctx, payload.Transcript, payload.Config.SummaryPrompt, func(chunk string) {
+	err := w.LLM.SummarizeStream(ctx, payload.Transcript, "", func(chunk string) {
 		summaryBuffer.WriteString(chunk)
 		w.notifySummaryChunk(payload.TaskID, chunk)
 		// 更新 Redis buffer，供 SSE 重連時恢復已產生的摘要

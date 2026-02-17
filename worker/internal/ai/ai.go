@@ -109,6 +109,7 @@ type StandardAIProvider struct {
 	LLMApiKey string
 	LLMURL    string
 	LLMModel  string
+	LLMPrompt string
 }
 
 // STT 呼叫 OpenAI 規範的語音轉錄 API。
@@ -163,7 +164,10 @@ func (o *StandardAIProvider) STT(ctx context.Context, filePath string) (string, 
 // Summarize 呼叫 OpenAI 規範的 ChatCompletion API 一次性生成摘要。
 func (o *StandardAIProvider) Summarize(ctx context.Context, text string, userPrompt string) (string, error) {
 	if userPrompt == "" {
-		userPrompt = "請摘要以下錄音文字內容："
+		userPrompt = o.LLMPrompt
+	}
+	if userPrompt == "" {
+		userPrompt = "請摘要以下內容："
 	}
 
 	payload := map[string]interface{}{
@@ -216,7 +220,10 @@ func (o *StandardAIProvider) Summarize(ctx context.Context, text string, userPro
 // Worker 在收到每個 chunk 後同步發布至 Redis Pub/Sub。
 func (o *StandardAIProvider) SummarizeStream(ctx context.Context, text string, userPrompt string, onChunk func(chunk string)) error {
 	if userPrompt == "" {
-		userPrompt = "請摘要以下錄音文字內容："
+		userPrompt = o.LLMPrompt
+	}
+	if userPrompt == "" {
+		userPrompt = "請摘要以下內容："
 	}
 
 	// 建立payload

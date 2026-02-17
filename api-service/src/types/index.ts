@@ -2,10 +2,6 @@
 export interface TaskConfig {
   /** 轉錄語言，例如 'zh-TW' */
   language: string;
-  /** STT 模型名稱，例如 'whisper-large' */
-  sttModel: string;
-  /** 自訂摘要 Prompt，空字串使用預設 */
-  summaryPrompt: string;
 }
 
 /**

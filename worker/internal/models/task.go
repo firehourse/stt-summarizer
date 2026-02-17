@@ -11,9 +11,7 @@ type TaskPayload struct {
 	Type       string `json:"type"` // "STT" 或 "SUMMARY"
 	Transcript string `json:"transcript,omitempty"`
 	Config     struct {
-		Language      string `json:"language"`
-		STTModel      string `json:"sttModel"`
-		SummaryPrompt string `json:"summaryPrompt"`
+		Language string `json:"language"`
 	} `json:"config"`
 }
 

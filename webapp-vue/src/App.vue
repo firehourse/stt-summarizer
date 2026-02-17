@@ -121,9 +121,7 @@ const requestResummarize = async () => {
   currentTask.value.message = '重新摘要中...'
   
   try {
-    await axios.post(`/api/tasks/${currentTask.value.id}/summarize`, {
-      prompt: '請用繁體中文摘要以下內容，列出三個重點。'
-    })
+    await axios.post(`/api/tasks/${currentTask.value.id}/summarize`)
     startListening(currentTask.value.id)
   } catch (err) {
     currentTask.value.status = 'failed'

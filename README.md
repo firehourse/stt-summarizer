@@ -20,6 +20,7 @@ cp .env.example .env
   - **AI_LLM_URL**: LLM 服務端點。
   - **AI_LLM_MODEL**: 選擇模型（如 `gemini-2.5-flash-lite` 或 `gpt-4`）。
   - **AI_LLM_KEY**: 填寫對應的 API 授權 Key。
+  - **AI_LLM_PROMPT**: 預設摘要 Prompt（例如：`請摘要以下內容：`）。
 
 ### 2. 啟動服務
 依據版本選擇

@@ -13,7 +13,6 @@ import { fileTypeFromBuffer } from 'file-type';
 
 /** 上傳根路徑，與 Worker 共享的 volume 掛載點 */
 const UPLOAD_BASE = '/app/uploads';
-const DEFAULT_PROMPT = '請摘要以下內容';
 
 /**
  * 任務路由插件，包含完整的任務生命週期操作。
@@ -116,9 +115,7 @@ export default async function taskRoutes(fastify: FastifyInstance, options: Fast
         creatorId: userId,
         filePath,
         config: {
-          language: 'zh-TW',
-          sttModel: 'whisper-large',
-          summaryPrompt: DEFAULT_PROMPT
+          language: 'zh-TW'
         }
       };
       await sendToQueue(message);
@@ -196,12 +193,10 @@ export default async function taskRoutes(fastify: FastifyInstance, options: Fast
   /**
    * POST /tasks/:id/summarize — 重新摘要。
    * 僅限 completed 狀態的任務，透過 Atomic Check (completed → processing) 後發布 SUMMARY Task。
-   * 支援自訂 prompt，未提供時使用預設。
    */
-  fastify.post('/tasks/:id/summarize', async (request: FastifyRequest<{ Params: { id: string }, Body: { prompt?: string } }>, reply: FastifyReply) => {
+  fastify.post('/tasks/:id/summarize', async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
     const { id: taskId } = request.params;
     const userId = (request as any).userId;
-    const { prompt } = (request.body as any) || {};
 
     const res = await db.query(
       'SELECT r.transcript FROM tasks t JOIN task_results r ON t.id = r.task_id WHERE t.id = $1 AND t.user_id = $2',
@@ -224,9 +219,7 @@ export default async function taskRoutes(fastify: FastifyInstance, options: Fast
       creatorId: userId,
       transcript: res.rows[0].transcript,
       config: {
-        language: 'zh-TW',
-        sttModel: 'whisper-large',
-        summaryPrompt: prompt || DEFAULT_PROMPT
+        language: 'zh-TW'
       }
     };
 
