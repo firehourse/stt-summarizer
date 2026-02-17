@@ -22,9 +22,13 @@ cp .env.example .env
   - **AI_LLM_KEY**: 填寫對應的 API 授權 Key。
 
 ### 2. 啟動服務
-
+依據版本選擇
 ```bash
 docker-compose up --build -d
+```
+
+```bash
+docker compose up -d
 ```
 
 ### 3. 使用方式

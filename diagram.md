@@ -20,6 +20,10 @@
 ## 1. 系統架構圖
 
 ```mermaid
+---
+config:
+  layout: elk
+---
 graph TB
     FE[Frontend<br/>Vue.js]
 
@@ -195,6 +199,10 @@ stateDiagram-v2
 ## 5. Gateway 分層架構（雲端部署視角）
 
 ```mermaid
+---
+config:
+  layout: elk
+---
 graph LR
     subgraph "Internet"
         User[用戶瀏覽器]
