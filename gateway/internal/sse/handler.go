@@ -82,18 +82,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 2: 讀取 summary buffer，恢復 SSE 重連時遺失的摘要內容
-	bufferKey := fmt.Sprintf("summary:buffer:%s", taskID)
-	buffer, err := h.Redis.Get(ctx, bufferKey).Result()
-	if err == nil && buffer != "" {
+	// Step 2: 讀取 buffer，恢復 SSE 重連時遺失的內容
+	// 2a. 轉譯內容恢復
+	transBufferKey := fmt.Sprintf("transcript:buffer:%s", taskID)
+	if tBuf, err := h.Redis.Get(ctx, transBufferKey).Result(); err == nil && tBuf != "" {
 		event := map[string]string{
-			"type":    "summary_chunk",
-			"content": buffer,
+			"type":    "transcript_update",
+			"content": tBuf,
 		}
 		data, _ := json.Marshal(event)
 		fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
 	}
+
+	// 2b. 摘要內容恢復
+	summaryBufferKey := fmt.Sprintf("summary:buffer:%s", taskID)
+	if sBuf, err := h.Redis.Get(ctx, summaryBufferKey).Result(); err == nil && sBuf != "" {
+		event := map[string]string{
+			"type":    "summary_chunk",
+			"content": sBuf,
+		}
+		data, _ := json.Marshal(event)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+	}
+	flusher.Flush()
 
 	// Step 3: 持續轉發 Redis Pub/Sub 事件至 SSE
 	ch := pubsub.Channel()

@@ -130,10 +130,10 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 
 	w.notifyProgress(payload.TaskID, 30, fmt.Sprintf("語音轉譯中（%d 段）...", len(chunks)))
 
-	// 2. 併發轉錄（Goroutine + Semaphore = 5，任一失敗即取消全部）
+	// 2. 併發轉錄（Goroutine + Semaphore = 2，降低本地 server 壓力）
 	transcripts := make([]string, len(chunks))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 5)
+	sem := make(chan struct{}, 2)
 
 	sttCtx, sttCancel := context.WithCancel(ctx)
 	defer sttCancel()
@@ -161,9 +161,20 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 			chunkCtx, chunkCancel := context.WithTimeout(sttCtx, 5*time.Minute)
 			defer chunkCancel()
 
-			chunkTranscript, err := w.STT.STT(chunkCtx, c.FilePath)
-			if err != nil {
-				if firstErr.CompareAndSwap(nil, err) {
+			// 實作簡單重試機制
+			var chunkTranscript string
+			var sttErr error
+			for attempt := 0; attempt < 3; attempt++ {
+				chunkTranscript, sttErr = w.STT.STT(chunkCtx, c.FilePath)
+				if sttErr == nil {
+					break
+				}
+				log.Printf("STT attempt %d failed for chunk %d: %v, retrying in 2s...", attempt+1, idx, sttErr)
+				time.Sleep(2 * time.Second)
+			}
+
+			if sttErr != nil {
+				if firstErr.CompareAndSwap(nil, sttErr) {
 					// 發生錯誤，通知同組的其他 goroutine 取消
 					sttCancel()
 				}
@@ -183,6 +194,8 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 					nextToStream++
 				}
 				w.notifyTranscriptUpdate(payload.TaskID, currentFullTranscript)
+				// 更新 Redis快取，供 SSE 重連時恢復已產生的轉錄內容
+				w.Redis.Set(ctx, fmt.Sprintf("transcript:buffer:%s", payload.TaskID), currentFullTranscript, 10*time.Minute)
 			}
 			streamingMu.Unlock()
 		}(i, chunk)
