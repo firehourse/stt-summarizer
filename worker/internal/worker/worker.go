@@ -119,8 +119,9 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 	}
 	w.notifyProgress(payload.TaskID, 10, "音檔處理中...")
 
-	// 1. 音檔切片（VAD 優先，超過 25MB 自動切割）
-	chunks, err := audio.SplitAudio(payload.FilePath, 30.0)
+	// 1. 音檔切片（VAD 優先）
+	const defaultMaxChunkDuration = 30.0
+	chunks, err := audio.SplitAudio(payload.FilePath, defaultMaxChunkDuration)
 	if err != nil {
 		w.handleError(payload, err)
 		return

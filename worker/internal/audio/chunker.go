@@ -18,31 +18,25 @@ type Chunk struct {
 	FilePath string
 }
 
+const (
+	// MaxFileSizeNoSplit 定義不進行切割的最大檔案大小。
+	// 設為 1MB 以符合本地開發及低延遲處理需求。
+	MaxFileSizeNoSplit = 1 * 1024 * 1024
+	// BytesPerSecond16kMono 為 16kHz Mono 16-bit WAV 的位元率 (32,000 bytes/s)。
+	BytesPerSecond16kMono = 32000
+)
+
 // SplitAudio 將音檔切割為符合 STT 模型限制的分片。
 //
 // 策略：
-//   - 小於 25MB 的檔案直接轉換格式，不切割
-//   - VAD 優先：使用 ffmpeg silencedetect 偵測 ≥0.5s 靜音段，在靜音中點切割
-//   - Overlap Fallback：目標點 ±5s 內無靜音段時，銜接處加入 1.5s 重疊避免斷詞
-//   - 格式標準化：所有分片統一轉換為 16kHz Mono WAV
+//   - 小於 MaxFileSizeNoSplit 的檔案直接轉換格式，不切割
+//   - VAD 優先：在硬性上限 (maxChunkDuration) 之前尋找最晚的靜音點
+//   - Overlap Fallback：無合適靜音點時執行硬切，銜接處加入 1.5s 重疊防止斷詞
+//   - 格式標準化：所有分片統一轉換為 16kHz Mono 16-bit WAV (保證大小)
 func SplitAudio(inputPath string, maxChunkDuration float64) ([]Chunk, error) {
 	tempDir := filepath.Join(filepath.Dir(inputPath), "chunks")
 	if err := os.MkdirAll(tempDir, 0755); err != nil {
 		return nil, err
-	}
-
-	// 小於 25MB 直接作為單一分片（符合 Whisper API 限制）
-	info, err := os.Stat(inputPath)
-	if err != nil {
-		return nil, err
-	}
-	if info.Size() < 25*1024*1024 {
-		outputPath := filepath.Join(tempDir, "chunk_0.wav")
-		cmd := exec.Command("ffmpeg", "-y", "-i", inputPath, "-ar", "16000", "-ac", "1", outputPath)
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("failed to convert audio: %v", err)
-		}
-		return []Chunk{{Index: 0, FilePath: outputPath}}, nil
 	}
 
 	duration, err := getDuration(inputPath)
@@ -50,9 +44,19 @@ func SplitAudio(inputPath string, maxChunkDuration float64) ([]Chunk, error) {
 		return nil, err
 	}
 
+	// 根據時長預估輸出大小，確保轉換後的單一 WAV 檔案不超過 MaxFileSizeNoSplit
+	if duration*float64(BytesPerSecond16kMono) < float64(MaxFileSizeNoSplit) {
+		outputPath := filepath.Join(tempDir, "chunk_0.wav")
+		cmd := exec.Command("ffmpeg", "-y", "-i", inputPath, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", outputPath)
+		if err := cmd.Run(); err != nil {
+			return nil, fmt.Errorf("failed to convert audio: %v", err)
+		}
+		return []Chunk{{Index: 0, FilePath: outputPath}}, nil
+	}
+
 	silences, err := getSilencePoints(inputPath)
 	if err != nil {
-		// VAD 失敗時退化為固定長度切割
+		// VAD 偵測失敗時退化為固定時長切割
 		silences = []float64{}
 	}
 
@@ -68,28 +72,25 @@ func SplitAudio(inputPath string, maxChunkDuration float64) ([]Chunk, error) {
 			targetEnd = duration
 		}
 
-		// 在目標切割點 ±5s 內搜尋最近的靜音點
+		// 實作硬性上限搜尋：在不超過 targetEnd 的前提下，尋找最晚的靜音點 (確保單一分片 < 1MB)
 		actualEnd := targetEnd
 		usedSilence := false
 		if targetEnd < duration {
 			bestSilence := -1.0
-			minDiff := 5.0
 
+			// 僅搜尋 (start, targetEnd] 範圍內的靜音點，確保不超標
 			for _, s := range silences {
-				if s <= start {
-					continue
-				}
-				diff := s - targetEnd
-				if diff < 0 {
-					diff = -diff
-				}
-				if diff < minDiff {
-					minDiff = diff
-					bestSilence = s
+				if s > start && s <= targetEnd {
+					// 取範圍內最後一個（最靠近上限）的靜音點，極大化分片效率
+					if s > bestSilence {
+						bestSilence = s
+					}
 				}
 			}
 
-			if bestSilence != -1.0 {
+			// 啟發式規則：僅在靜音點位於目標點前的 10s 內才採用
+			// 若靜音點太早，則直接執行硬切（透過 1.5s Overlap 補償語義中斷）
+			if bestSilence != -1.0 && (targetEnd-bestSilence) < 10.0 {
 				actualEnd = bestSilence
 				usedSilence = true
 			}
@@ -102,11 +103,11 @@ func SplitAudio(inputPath string, maxChunkDuration float64) ([]Chunk, error) {
 
 		outputPath := filepath.Join(tempDir, fmt.Sprintf("chunk_%d.wav", index))
 
-		// 切割並轉換為 16kHz Mono WAV
+		// 切割並轉換為 16kHz Mono 16-bit WAV (約 32,000 bytes/s)
 		chunkLen := actualEnd - start
 		cmd := exec.Command("ffmpeg", "-y", "-ss", strconv.FormatFloat(start, 'f', 3, 64),
 			"-t", strconv.FormatFloat(chunkLen, 'f', 3, 64), "-i", inputPath,
-			"-ar", "16000", "-ac", "1", outputPath)
+			"-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", outputPath)
 
 		if err := cmd.Run(); err != nil {
 			return nil, fmt.Errorf("failed to create chunk %d: %v", index, err)
