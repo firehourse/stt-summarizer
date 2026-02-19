@@ -141,6 +141,11 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 	var firstErr atomic.Value
 	var completedChunks int32
 
+	// 累進式推送狀態
+	var streamingMu sync.Mutex
+	nextToStream := 0
+	currentFullTranscript := ""
+
 	for i, chunk := range chunks {
 		wg.Add(1)
 		go func(idx int, c audio.Chunk) {
@@ -168,6 +173,18 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 
 			completed := atomic.AddInt32(&completedChunks, 1)
 			w.notifyProgress(payload.TaskID, 30+int(completed)*40/len(chunks), "語音轉譯中...")
+
+			// 累進式順序推送文字給前端
+			streamingMu.Lock()
+			if idx == nextToStream {
+				// 如果完成的是我們正在等待的下一個分片，就開始往後推
+				for nextToStream < len(chunks) && transcripts[nextToStream] != "" {
+					currentFullTranscript = mergeTranscripts(currentFullTranscript, transcripts[nextToStream])
+					nextToStream++
+				}
+				w.notifyTranscriptUpdate(payload.TaskID, currentFullTranscript)
+			}
+			streamingMu.Unlock()
 		}(i, chunk)
 	}
 
@@ -294,6 +311,16 @@ func (w *Worker) notifyCompleted(taskID string) {
 	rdb_lib.PublishProgress(w.Redis, context.Background(), taskID, event)
 }
 
+// notifyTranscriptUpdate 發布累進式的轉錄結果，前端收到後直接替換顯示內容。
+func (w *Worker) notifyTranscriptUpdate(taskID, content string) {
+	event := models.SSEEvent{
+		TaskID:  taskID,
+		Type:    "transcript_update",
+		Content: content,
+	}
+	rdb_lib.PublishProgress(w.Redis, context.Background(), taskID, event)
+}
+
 // notifyEvent 發布通用事件（如 failed、cancelled）。
 func (w *Worker) notifyEvent(taskID, eventType, msg string) {
 	event := models.SSEEvent{
@@ -325,7 +352,6 @@ func (w *Worker) handleError(payload models.TaskPayload, err error) {
 }
 
 // mergeTranscripts 智能合併兩段具有重疊可能的文字。
-// 演算法：尋找 A 的末端與 B 的開端最長的重複子串（以空白分隔的單詞為單位）。
 func mergeTranscripts(t1, t2 string) string {
 	t1 = strings.TrimSpace(t1)
 	t2 = strings.TrimSpace(t2)
