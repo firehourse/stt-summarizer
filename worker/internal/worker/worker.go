@@ -183,8 +183,14 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 		return
 	}
 
-	// 3. 合併轉錄結果並持久化（確保 LLM 失敗時 transcript 不遺失）
-	fullTranscript := strings.Join(transcripts, " ")
+	// 3. 智能合併轉錄結果（移除 Overlap 產生的重複詞彙）
+	fullTranscript := ""
+	if len(transcripts) > 0 {
+		fullTranscript = transcripts[0]
+		for i := 1; i < len(transcripts); i++ {
+			fullTranscript = mergeTranscripts(fullTranscript, transcripts[i])
+		}
+	}
 
 	if err := db.SaveTranscript(w.DB, payload.TaskID, fullTranscript); err != nil {
 		w.handleError(payload, fmt.Errorf("failed to save transcript: %v", err))
@@ -316,6 +322,53 @@ func (w *Worker) handleError(payload models.TaskPayload, err error) {
 	if payload.Type == "STT" {
 		w.cleanup(payload.FilePath)
 	}
+}
+
+// mergeTranscripts 智能合併兩段具有重疊可能的文字。
+// 演算法：尋找 A 的末端與 B 的開端最長的重複子串（以空白分隔的單詞為單位）。
+func mergeTranscripts(t1, t2 string) string {
+	t1 = strings.TrimSpace(t1)
+	t2 = strings.TrimSpace(t2)
+	if t1 == "" {
+		return t2
+	}
+	if t2 == "" {
+		return t1
+	}
+
+	w1 := strings.Fields(t1)
+	w2 := strings.Fields(t2)
+
+	// 設定最大比對窗口（例如 10 個單詞，足以涵蓋 1.5s 的重疊）
+	maxMatch := 10
+	if len(w1) < maxMatch {
+		maxMatch = len(w1)
+	}
+	if len(w2) < maxMatch {
+		maxMatch = len(w2)
+	}
+
+	bestMatchLen := 0
+	for i := 1; i <= maxMatch; i++ {
+		// 取 t1 最後 i 個單詞與 t2 最前 i 個單詞比較
+		match := true
+		for j := 0; j < i; j++ {
+			if w1[len(w1)-i+j] != w2[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			bestMatchLen = i
+		}
+	}
+
+	// 合併：t1 + t2(去掉重複部分)
+	remainingW2 := w2[bestMatchLen:]
+	if len(remainingW2) == 0 {
+		return t1
+	}
+	return t1 + " " + strings.Join(remainingW2, " ")
 }
 
 // cleanup 刪除已處理完成的音檔，釋放磁碟空間。
