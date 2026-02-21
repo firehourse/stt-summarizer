@@ -6,7 +6,6 @@ import { v4 as uuidv4 } from 'uuid';
 import { pipeline } from 'stream/promises';
 import { Readable } from 'stream';
 import { db } from '../lib/db.js';
-import { sendToQueue } from '../lib/queue.js';
 import redis from '../lib/redis.js';
 import { TaskMessage } from '../types/index.js';
 import { fileTypeFromBuffer } from 'file-type';
@@ -107,18 +106,35 @@ export default async function taskRoutes(fastify: FastifyInstance, options: Fast
 
       await pipeline(combinedStream, fs.createWriteStream(filePath));
 
-      await db.query('UPDATE tasks SET file_path = $1 WHERE id = $2 AND user_id = $3', [filePath, taskId, userId]);
+      const client = await db.pool.connect();
+      try {
+        await client.query('BEGIN');
 
-      const message: TaskMessage = {
-        type: 'STT',
-        taskId,
-        creatorId: userId,
-        filePath,
-        config: {
-          language: 'zh-TW'
-        }
-      };
-      await sendToQueue(message);
+        await client.query(
+          'UPDATE tasks SET file_path = $1 WHERE id = $2 AND user_id = $3',
+          [filePath, taskId, userId]
+        );
+
+        const message: TaskMessage = {
+          type: 'STT',
+          taskId,
+          creatorId: userId,
+          filePath,
+          config: { language: 'zh-TW' }
+        };
+
+        await client.query(
+          'INSERT INTO outbox_events (aggregate_id, event_type, payload) VALUES ($1, $2, $3)',
+          [taskId, 'STT', JSON.stringify(message)]
+        );
+
+        await client.query('COMMIT');
+      } catch (e) {
+        await client.query('ROLLBACK');
+        throw e;
+      } finally {
+        client.release();
+      }
 
       return { status: 'upload_complete', taskId };
     } catch (err) {
@@ -204,26 +220,42 @@ export default async function taskRoutes(fastify: FastifyInstance, options: Fast
     );
     if (res.rows.length === 0) return reply.code(404).send({ error: 'Task result not found' });
 
-    // Atomic: completed → processing
-    const updateResult = await db.query(
-      "UPDATE tasks SET status = 'processing', updated_at = NOW() WHERE id = $1 AND status = 'completed'",
-      [taskId]
-    );
-    if (updateResult.rowCount === 0) {
-      return reply.code(409).send({ error: 'Task is not in completed state' });
-    }
+    // Atomic: completed → processing + Outbox Event
+    const client = await db.pool.connect();
+    try {
+      await client.query('BEGIN');
 
-    const message: TaskMessage = {
-      type: 'SUMMARY',
-      taskId,
-      creatorId: userId,
-      transcript: res.rows[0].transcript,
-      config: {
-        language: 'zh-TW'
+      const updateResult = await client.query(
+        "UPDATE tasks SET status = 'processing', updated_at = NOW() WHERE id = $1 AND status = 'completed'",
+        [taskId]
+      );
+
+      if (updateResult.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return reply.code(409).send({ error: 'Task is not in completed state' });
       }
-    };
 
-    await sendToQueue(message);
-    return { status: 'summary_requested' };
+      const message: TaskMessage = {
+        type: 'SUMMARY',
+        taskId,
+        creatorId: userId,
+        transcript: res.rows[0].transcript,
+        config: { language: 'zh-TW' }
+      };
+
+      await client.query(
+        'INSERT INTO outbox_events (aggregate_id, event_type, payload) VALUES ($1, $2, $3)',
+        [taskId, 'SUMMARY', JSON.stringify(message)]
+      );
+
+      await client.query('COMMIT');
+      return { status: 'summary_requested' };
+    } catch (e) {
+      await client.query('ROLLBACK');
+      fastify.log.error(e);
+      return reply.code(500).send({ error: 'Failed to request summary' });
+    } finally {
+      client.release();
+    }
   });
 }

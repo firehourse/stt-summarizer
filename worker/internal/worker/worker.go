@@ -213,7 +213,7 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 		return
 	}
 
-	// 3. 智能合併轉錄結果（移除 Overlap 產生的重複詞彙）
+	// 3. 智能合併轉錄結果
 	fullTranscript := ""
 	if len(transcripts) > 0 {
 		fullTranscript = transcripts[0]
@@ -222,15 +222,7 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 		}
 	}
 
-	if err := db.SaveTranscript(w.DB, payload.TaskID, fullTranscript); err != nil {
-		w.handleError(payload, fmt.Errorf("failed to save transcript: %v", err))
-		return
-	}
-
-	w.notifyProgress(payload.TaskID, 75, "轉錄完成，準備生成摘要...")
-	w.cleanup(payload.FilePath)
-
-	// 4. 發布 SUMMARY Task 回 Queue（解耦 Pipeline）
+	// 4. 原子存儲：將轉錄結果與 SUMMARY 任務 Outbox 事件綁定在同一個事務中
 	summaryPayload := models.TaskPayload{
 		TaskID:     payload.TaskID,
 		CreatorID:  payload.CreatorID,
@@ -238,15 +230,26 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 		Transcript: fullTranscript,
 		Config:     payload.Config,
 	}
-	if err := w.publishTask(summaryPayload); err != nil {
-		w.handleError(payload, fmt.Errorf("failed to enqueue summary task: %v", err))
+
+	if err := db.SaveSTTResultsWithOutbox(w.DB, payload.TaskID, fullTranscript, summaryPayload); err != nil {
+		w.handleError(payload, fmt.Errorf("failed to save results and outbox event: %v", err))
 		return
 	}
+
+	w.notifyProgress(payload.TaskID, 75, "轉錄完成，已加入摘要排程...")
+	w.cleanup(payload.FilePath)
 }
 
 // handleSummary 執行 LLM 摘要階段：串流生成摘要，每個 chunk 即時推送 SSE 並更新 Redis buffer。
 func (w *Worker) handleSummary(ctx context.Context, payload models.TaskPayload) {
 	log.Printf("Processing Summary task: %s", payload.TaskID)
+
+	// Atomic Check: 確保任務處於 processing，防止因重送造成的多次 LLM 調用（冪等性）
+	if err := db.StartSummaryCheck(w.DB, payload.TaskID); err != nil {
+		log.Printf("Summary skipped for task %s (likely duplicated or already processed): %v", payload.TaskID, err)
+		return
+	}
+
 	w.notifyProgress(payload.TaskID, 80, "摘要生成中...")
 
 	var summaryBuffer strings.Builder
@@ -272,6 +275,85 @@ func (w *Worker) handleSummary(ctx context.Context, payload models.TaskPayload) 
 	}
 
 	w.notifyCompleted(payload.TaskID)
+}
+
+// StartOutboxRelay 啟動背景協程，定期掃描並發布 Outbox 事件。
+func (w *Worker) StartOutboxRelay(ctx context.Context) {
+	log.Println("Outbox relay started")
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Outbox relay stopped")
+			return
+		case <-ticker.C:
+			w.processOutbox()
+		}
+	}
+}
+
+// StartReaper 啟動定時清理器，回收超時的「Processing」任務（Reaper Pattern）。
+// 透過 Redis 分散式鎖 (Leader Election) 確保叢集中只有單一 Worker 執行清理，避免 DB 競爭。
+func (w *Worker) StartReaper(ctx context.Context) {
+	log.Println("Reaper started (with Leader Election mechanism)")
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	lockKey := "worker:reaper:lock"
+	lockTTL := 2 * time.Minute // 鎖持有時間必須小於 Ticker 週期，確保下一輪重新選舉順利
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Reaper stopped")
+			return
+		case <-ticker.C:
+			// 1. 透過 SetNX (SET if Not eXists) 嘗試取得全域鎖，競爭成為 Leader
+			acquired, err := w.Redis.SetNX(ctx, lockKey, "locked", lockTTL).Result()
+			if err != nil {
+				log.Printf("Reaper: failed to acquire leader lock: %v", err)
+				continue
+			}
+
+			// 2. 若未取得鎖，身為 Follower 直接略過（不記 Log 避免多節點刷頻），讓 Leader 執行即可
+			if !acquired {
+				continue
+			}
+
+			// 3. 成功奪魁，以 Leader 身分執行全表掃描與狀態清理
+			count, err := db.CleanTimedOutTasks(w.DB, 30) // 清除 30 分鐘超時未完成的任務
+			if err != nil {
+				log.Printf("Reaper (Leader): failed to clean tasks: %v", err)
+			} else if count > 0 {
+				log.Printf("Reaper (Leader): cleaned up %d timed out tasks", count)
+			}
+		}
+	}
+}
+
+// processOutbox 執行單次 Outbox 掃描與發布。
+func (w *Worker) processOutbox() {
+	err := db.ProcessOutboxEvents(w.DB, 10, func(event models.OutboxEvent) error {
+		var payload models.TaskPayload
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			log.Printf("Relay: failed to unmarshal event %s: %v", event.ID, err)
+			return err
+		}
+
+		if err := w.publishTask(payload); err != nil {
+			log.Printf("Relay: failed to publish event %s: %v", event.ID, err)
+			return err
+		}
+
+		log.Printf("Relay: successfully published event %s (Task: %s)", event.ID, payload.TaskID)
+		return nil
+	})
+
+	if err != nil && err != sql.ErrNoRows {
+		log.Printf("Relay: failed to process outbox events: %v", err)
+	}
 }
 
 // publishTask 將任務訊息發布回 RabbitMQ tasks 佇列。

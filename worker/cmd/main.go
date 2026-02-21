@@ -90,6 +90,12 @@ func main() {
 	// 啟動取消信號監聽（自帶重訂閱機制）
 	go w.StartCancellationListener(context.Background())
 
+	// 啟動 Outbox Relay（確保 STT -> SUMMARY 轉換的一致性）
+	go w.StartOutboxRelay(context.Background())
+
+	// 啟動 Reaper（回收超時卡死的任務）
+	go w.StartReaper(context.Background())
+
 	// Graceful Shutdown：監聯 SIGINT/SIGTERM
 	shutdownCh := make(chan os.Signal, 1)
 	signal.Notify(shutdownCh, syscall.SIGINT, syscall.SIGTERM)
