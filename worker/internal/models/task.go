@@ -38,3 +38,13 @@ type SSEEvent struct {
 	Message  string `json:"message,omitempty"`
 	Content  string `json:"content,omitempty"` // summary_chunk 專用
 }
+
+// OutboxEvent 對應 DB outbox_events 表，用於 Transactional Outbox Pattern。
+type OutboxEvent struct {
+	ID          string     `json:"id"`
+	EventType   string     `json:"event_type"`
+	Payload     []byte     `json:"payload"`
+	Status      string     `json:"status"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ProcessedAt *time.Time `json:"processed_at,omitempty"`
+}

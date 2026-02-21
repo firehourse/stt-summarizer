@@ -2,8 +2,10 @@ package db
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
+	"tts-worker/internal/models"
 
 	_ "github.com/lib/pq"
 )
@@ -73,22 +75,115 @@ func UpdateTaskStatus(db *sql.DB, taskID string, status string, transcript strin
 	return tx.Commit()
 }
 
-// GetTaskStatus 查詢任務的當前狀態與擁有者。
-func GetTaskStatus(db *sql.DB, taskID string) (string, string, error) {
-	var status, userID string
-	err := db.QueryRow("SELECT status, user_id FROM tasks WHERE id = $1", taskID).Scan(&status, &userID)
-	return status, userID, err
-}
+// SaveSTTResultsWithOutbox 將 STT 轉錄結果與 Outbox 事件綁定在同一個事務中。
+// 這確保了「結果儲存」與「摘要請求」的原子性。
+func SaveSTTResultsWithOutbox(db *sql.DB, taskID string, transcript string, outboxPayload interface{}) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 
-// SaveTranscript 在 STT 完成後持久化 transcript，不改變任務狀態。
-// 這確保 STT 結果在 SUMMARY 階段開始前已安全儲存於 DB，
-// 即使 LLM 失敗也不會遺失已轉錄的內容。
-func SaveTranscript(db *sql.DB, taskID string, transcript string) error {
-	_, err := db.Exec(`
+	// 1. 持久化轉錄結果
+	_, err = tx.Exec(`
 		INSERT INTO task_results (task_id, transcript, updated_at)
 		VALUES ($1, $2, NOW())
 		ON CONFLICT (task_id) DO UPDATE SET
 			transcript = $2,
 			updated_at = NOW()`, taskID, transcript)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// 2. 插入 Outbox 事件
+	payloadJSON, err := json.Marshal(outboxPayload)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(`
+		INSERT INTO outbox_events (aggregate_id, event_type, payload)
+		VALUES ($1, $2, $3)`, taskID, "SUMMARY", payloadJSON)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// ProcessOutboxEvents 以 Transaction 鎖定並取得待處理的 Outbox 事件（使用 SKIP LOCKED 避免 Worker 爭用）。
+// 處理完成後，更新狀態為 sent。
+func ProcessOutboxEvents(db *sql.DB, limit int, processFn func(event models.OutboxEvent) error) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`
+		SELECT id, event_type, payload, status, created_at
+		FROM outbox_events
+		WHERE status = 'pending'
+		ORDER BY created_at ASC
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED`, limit)
+	if err != nil {
+		return err
+	}
+
+	var events []models.OutboxEvent
+	for rows.Next() {
+		var e models.OutboxEvent
+		if err := rows.Scan(&e.ID, &e.EventType, &e.Payload, &e.Status, &e.CreatedAt); err != nil {
+			rows.Close()
+			return err
+		}
+		events = append(events, e)
+	}
+	rows.Close()
+
+	if len(events) == 0 {
+		return sql.ErrNoRows
+	}
+
+	for _, event := range events {
+		if err := processFn(event); err != nil {
+			continue // 單筆處理失敗，保留 pending 狀態以便重試
+		}
+
+		_, err = tx.Exec(`
+			UPDATE outbox_events
+			SET status = 'sent', processed_at = NOW()
+			WHERE id = $1`, event.ID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// StartSummaryCheck 針對 SUMMARY 任務執行 Atomic Check。
+// 確保任務處於 processing 狀態，避免因 RabbitMQ 重複投遞而造成多次 LLM 調用。
+func StartSummaryCheck(db *sql.DB, taskID string) error {
+	result, err := db.Exec(`UPDATE tasks SET updated_at = NOW() WHERE id = $1 AND status = 'processing'`, taskID)
+	if err != nil {
+		return err
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		return fmt.Errorf("task %s state transition rejected (not in processing state)", taskID)
+	}
+	return nil
+}
+
+// CleanTimedOutTasks 尋找並標記已超時的「處理中」任務（Reaper Pattern）。
+func CleanTimedOutTasks(db *sql.DB, timeoutMinutes int) (int64, error) {
+	result, err := db.Exec(`
+		UPDATE tasks
+		SET status = 'failed', error_message = 'Task timed out (system recovery)', updated_at = NOW()
+		WHERE status = 'processing' AND updated_at < NOW() - ($1 || ' minutes')::INTERVAL`, timeoutMinutes)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
