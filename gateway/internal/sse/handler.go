@@ -12,18 +12,22 @@ import (
 
 // Handler SSE 連線管理器，處理 GET /api/tasks/{id}/events。
 //
-// 連線流程（防止 race condition）：
-//  1. 先訂閱 Redis Pub/Sub channel，確保不遺漏事件
-//  2. 再讀取 summary buffer，恢復已產生的摘要內容
-//  3. 持續將 Redis 事件轉發至 SSE 回應流
-//  4. 客戶端斷線時取消訂閱，釋放資源
+// 連線流程（加入 Multiplexer 防止連接數飆高）：
+//  1. 註冊 Gateway 在記憶體內的 Broadcaster，不再對 Redis 開實體連線
+//  2. 讀取 summary buffer，恢復已產生的摘要內容
+//  3. 持續讀取 Broadcaster 派發的事件並寫入 SSE
+//  4. 客戶端斷線時向 Broadcaster 註銷，釋放 Channel
 type Handler struct {
-	Redis *redis.Client
+	Redis       *redis.Client
+	Broadcaster *Broadcaster
 }
 
 // NewHandler 建立 SSE Handler 實例。
-func NewHandler(rdb *redis.Client) *Handler {
-	return &Handler{Redis: rdb}
+func NewHandler(rdb *redis.Client, b *Broadcaster) *Handler {
+	return &Handler{
+		Redis:       rdb,
+		Broadcaster: b,
+	}
 }
 
 // ServeHTTP 處理單一 SSE 連線。
@@ -71,16 +75,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 
-	// Step 1: 先訂閱，防止 buffer 讀取與新事件之間的 race condition
-	channel := fmt.Sprintf("progress:%s", taskID)
-	pubsub := h.Redis.Subscribe(ctx, channel)
-	defer pubsub.Close()
-
-	if _, err := pubsub.Receive(ctx); err != nil {
-		log.Printf("SSE: failed to subscribe to %s: %v", channel, err)
-		http.Error(w, "Failed to subscribe", http.StatusInternalServerError)
-		return
-	}
+	// Step 1: 註冊記憶體 Channel，防止 buffer 讀取與新事件之間的 race condition
+	msgCh := h.Broadcaster.Subscribe(taskID)
+	defer h.Broadcaster.Unsubscribe(taskID, msgCh)
 
 	// Step 2: 讀取 buffer，恢復 SSE 重連時遺失的內容
 	// 2a. 轉譯內容恢復
@@ -106,15 +103,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	flusher.Flush()
 
-	// Step 3: 持續轉發 Redis Pub/Sub 事件至 SSE
-	ch := pubsub.Channel()
+	// Step 3: 持續讀取 Broadcaster 分發的事件至 SSE
 	for {
 		select {
-		case msg, ok := <-ch:
+		case msgPayload, ok := <-msgCh:
 			if !ok {
 				return
 			}
-			fmt.Fprintf(w, "data: %s\n\n", msg.Payload)
+			fmt.Fprintf(w, "data: %s\n\n", msgPayload)
 			flusher.Flush()
 
 		case <-ctx.Done():

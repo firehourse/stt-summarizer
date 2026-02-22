@@ -49,7 +49,7 @@ graph TB
     FE -- "HTTP Request" --> GW
     FE -. "SSE 長連接" .-> GW
     GW -- "反向代理<br/>注入 X-User-Id" --> API
-    GW -- "訂閱 progress:{taskId}" --> RD
+    GW -- "單線程 PSUBSCRIBE<br/>Multi-plexing" --> RD
 
     API -- "任務 CRUD" --> PG
     API -- "發布 STT Task" --> MQ
@@ -96,8 +96,9 @@ sequenceDiagram
 
     Note over FE,RD: Phase 2 — SSE Connection
 
+    Note over GW,RD: Gateway 背景 Broadcaster 持續 PSUBSCRIBE progress:*
     FE->>GW: GET /api/tasks/{id}/events (SSE)
-    GW->>RD: SUBSCRIBE progress:{taskId}
+    GW->>GW: 註冊 SSE Channel 至 Broadcaster
     GW->>RD: GET summary:buffer:{taskId}
     GW-->>FE: SSE: buffer recovery (if exists)
 
