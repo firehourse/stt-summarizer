@@ -34,7 +34,10 @@ func main() {
 	}
 	log.Println("Redis connected")
 
-	sseHandler := sse.NewHandler(rdb)
+	broadcaster := sse.NewBroadcaster(rdb)
+	go broadcaster.Run(context.Background())
+
+	sseHandler := sse.NewHandler(rdb, broadcaster)
 	apiProxy := proxy.NewAPIProxy(apiServiceURL)
 
 	mux := http.NewServeMux()

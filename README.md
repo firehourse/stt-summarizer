@@ -23,9 +23,11 @@ cp .env.example .env
   - **AI_LLM_PROMPT**: 預設摘要 Prompt（例如：`請摘要以下內容：`）。
 
 ### 2. 啟動服務
+
 依據版本選擇
+
 ```bash
-docker-compose up --build -d
+docker-compose up -d
 ```
 
 ```bash
@@ -80,14 +82,18 @@ docker compose up -d
 1. 非同步解耦架構:
    將 STT 與 LLM 拆分為獨立 Task。若 LLM 階段失敗，可直接重發 SUMMARY Task 而無需重新執行耗時且昂貴的 STT 轉譯。
 
-2. 串流處理優化:
-   全系統採用 Streaming Pipeline。音檔從前端上傳到 Worker 處理均不佔用記憶體空間。LLM 摘要採用串流輸出，透過 Redis Pub/Sub 即時推送至 Gateway 輸出給用戶。
+2. 端到端串流體驗 (Streaming Engine):
+   全系統採用串流傳輸。音檔從前端上傳到 Worker 處理均不佔用記憶體空間。不僅 LLM 摘要以 Chunk 推送，STT 轉錄結果也支援「漸進式串流輸出」，用戶無需等待全檔處理完畢即可即時觀看轉錄進度。
 
-3. 智能音檔切片:
-   Worker 整合 VAD (Voice Activity Detection) 策略。針對大型音檔自動在靜音段進行切割，確保每段轉譯都在 25MB 限制內且語句不中斷。
+3. 智能音檔切片 (VAD):
+   Worker 整合 VAD (Voice Activity Detection) 策略。針對大型音檔自動在靜音段進行切割，確保每段轉譯都在最佳範圍內且語句不中斷，提升辨識精準度與併發效率。
 
-4. 原子狀態保證:
-   所有任務狀態變更均符合資料庫交易原則。Worker 在消費任務時具備原子性檢查，防止重複消費或狀態混亂。
+4. 企業級可靠性模式 (Reliability Patterns):
+   - **Outbox Pattern**: STT 結果寫入與下一個任務（摘要）觸發綁定在同一個資料庫 Transaction 中，解決雙寫不一致，保證訊息 100% 遞送至 RabbitMQ。
+   - **Reaper Pattern**: 內建分散式定時清理機制，Worker 利用 Redis Leader Election (SETNX) 確保全域只有單一節點負責回收「超時卡死」的任務，避免資料庫效能雪崩。
+
+5. SSE 多工廣播防禦 (Broadcaster Multiplexer):
+   Gateway 扮演長連接守門員，內部實作 Thread-safe 的 Broadcaster 模式，對 Redis 僅維持「唯一」一條 Pattern 訂閱，將事件分發給無限個 SSE 客戶端連線，保護後端免受連線爆破威脅 (O(1) 依賴)。
 
 ---
 
