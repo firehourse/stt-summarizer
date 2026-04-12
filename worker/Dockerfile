@@ -8,4 +8,5 @@ FROM alpine:latest
 RUN apk add --no-cache ffmpeg ca-certificates
 WORKDIR /app
 COPY --from=builder /app/worker .
+COPY --from=builder /app/migrations ./migrations
 CMD ["./worker"]

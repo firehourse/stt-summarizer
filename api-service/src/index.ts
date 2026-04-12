@@ -5,7 +5,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import taskRoutes from './routes/tasks.js';
-import { connect as connectQueue } from './lib/queue.js';
 import { db } from './lib/db.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -34,18 +33,17 @@ fastify.get('/health', async () => {
 });
 
 /**
- * 啟動流程：依序驗證 DB → RabbitMQ → 開始監聽。
- * 任一依賴不可達時直接終止進程，由 Docker restart 策略自動重啟。
+ * 啟動流程：依序驗證 DB → 開始監聽。
+ * DB 不可達時直接終止進程，由 Docker restart 策略自動重啟。
  */
 const start = async () => {
   try {
     await db.query('SELECT 1');
-    console.log('Database connected');
+    fastify.log.info('Database connected');
 
-    await connectQueue();
     const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
     await fastify.listen({ port, host: '0.0.0.0' });
-    console.log(`API Service listening on port ${port}`);
+    fastify.log.info(`API Service listening on port ${port}`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

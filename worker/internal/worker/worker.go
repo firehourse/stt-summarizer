@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -18,40 +19,33 @@ import (
 	rdb_lib "tts-worker/internal/redis"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/streadway/amqp"
+)
+
+const (
+	queueSTT        = "stt:queue"
+	queueSummary    = "summary:queue"
+	processingSTT   = "stt:processing"
+	processingSummary = "summary:processing"
 )
 
 // Worker 任務處理器，持有所有外部依賴的連線。
 // activeCancels 儲存進行中任務的 cancel 函數，供取消信號觸發時使用。
-// publishCh 與 publishMu 確保發布 SUMMARY Task 回 Queue 時的執行緒安全。
 type Worker struct {
 	DB            *sql.DB
 	Redis         *redis.Client
 	STT           ai.STTService
 	LLM           ai.Summarizer
 	activeCancels sync.Map
-	publishCh     *amqp.Channel
-	publishMu     sync.Mutex
 }
 
 // NewWorker 建立 Worker 實例，注入所有外部依賴。
-// publishCh 可為 nil，後續透過 SetPublishChannel 設定（支援重連場景）。
-func NewWorker(postgres *sql.DB, rdb *redis.Client, sttSvc ai.STTService, llmSvc ai.Summarizer, publishCh *amqp.Channel) *Worker {
+func NewWorker(postgres *sql.DB, rdb *redis.Client, sttSvc ai.STTService, llmSvc ai.Summarizer) *Worker {
 	return &Worker{
-		DB:        postgres,
-		Redis:     rdb,
-		STT:       sttSvc,
-		LLM:       llmSvc,
-		publishCh: publishCh,
+		DB:    postgres,
+		Redis: rdb,
+		STT:   sttSvc,
+		LLM:   llmSvc,
 	}
-}
-
-// SetPublishChannel 更新 publish channel（RabbitMQ 重連後舊 channel 已失效）。
-// 透過 mutex 確保與 publishTask 的執行緒安全。
-func (w *Worker) SetPublishChannel(ch *amqp.Channel) {
-	w.publishMu.Lock()
-	defer w.publishMu.Unlock()
-	w.publishCh = ch
 }
 
 // StartCancellationListener 訂閱 Redis cancel_channel，
@@ -61,7 +55,6 @@ func (w *Worker) StartCancellationListener(ctx context.Context) {
 	for {
 		w.listenCancellations(ctx)
 
-		// ctx 被取消代表 Worker 正在關閉，不需要重訂閱
 		if ctx.Err() != nil {
 			log.Println("Cancellation listener stopped (context cancelled)")
 			return
@@ -72,14 +65,11 @@ func (w *Worker) StartCancellationListener(ctx context.Context) {
 	}
 }
 
-// listenCancellations 單次訂閱 Redis cancel_channel 並處理取消信號。
-// channel 被關閉或斷線時返回，由 StartCancellationListener 決定是否重訂閱。
 func (w *Worker) listenCancellations(ctx context.Context) {
 	pubsub := rdb_lib.SubscribeToCancellations(w.Redis, ctx)
 	defer pubsub.Close()
 
-	ch := pubsub.Channel()
-	for msg := range ch {
+	for msg := range pubsub.Channel() {
 		var cancelMsg struct {
 			TaskID string `json:"taskId"`
 		}
@@ -92,45 +82,100 @@ func (w *Worker) listenCancellations(ctx context.Context) {
 	}
 }
 
-// ProcessTask 任務處理入口，根據 Type 分派至 handleSTT 或 handleSummary。
-// 每個任務擁有獨立的 context，支援透過 Cancel Signal 即時終止。
-func (w *Worker) ProcessTask(payload models.TaskPayload) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+// ConsumeSTTQueue 阻塞消費 stt:queue，每個任務在獨立 goroutine 中處理。
+// BLPOP 原子取出後立即 ZADD 至 stt:processing ZSET 供 Reaper 追蹤。
+func (w *Worker) ConsumeSTTQueue(ctx context.Context) {
+	log.Println("STT queue consumer started")
+	for {
+		result, err := w.Redis.BLPop(ctx, 0, queueSTT).Result()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("ConsumeSTTQueue: BLPOP error: %v, retrying in 1s...", err)
+			time.Sleep(time.Second)
+			continue
+		}
 
-	w.activeCancels.Store(payload.TaskID, cancel)
-	defer w.activeCancels.Delete(payload.TaskID)
+		rawPayload := result[1]
+		w.Redis.ZAdd(ctx, processingSTT, redis.Z{
+			Score:  float64(time.Now().Unix()),
+			Member: rawPayload,
+		})
 
-	if payload.Type == "SUMMARY" {
-		w.handleSummary(ctx, payload)
-	} else {
-		w.handleSTT(ctx, payload)
+		var payload models.STTPayload
+		if err := json.Unmarshal([]byte(rawPayload), &payload); err != nil {
+			log.Printf("ConsumeSTTQueue: unmarshal error: %v, discarding message", err)
+			w.Redis.ZRem(ctx, processingSTT, rawPayload)
+			continue
+		}
+
+		go func(p models.STTPayload, raw string) {
+			taskCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			w.activeCancels.Store(p.TaskID, cancel)
+			defer w.activeCancels.Delete(p.TaskID)
+			w.handleSTT(taskCtx, p, raw)
+		}(payload, rawPayload)
 	}
 }
 
-// handleSTT 執行 STT 階段：音檔切片 → 併發轉錄 → 儲存 transcript → 發布 SUMMARY Task。
-// 流程中的每個階段都會透過 Redis Pub/Sub 發布進度事件。
-func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
-	log.Printf("Processing STT task: %s", payload.TaskID)
-	err := db.UpdateTaskStatus(w.DB, payload.TaskID, "processing", "", "", "")
-	if err != nil {
-		w.notifyEvent(payload.TaskID, "failed", "Task already cancelled or invalid state")
-		return
+// ConsumeSummaryQueue 阻塞消費 summary:queue，每個任務在獨立 goroutine 中處理。
+func (w *Worker) ConsumeSummaryQueue(ctx context.Context) {
+	log.Println("Summary queue consumer started")
+	for {
+		result, err := w.Redis.BLPop(ctx, 0, queueSummary).Result()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("ConsumeSummaryQueue: BLPOP error: %v, retrying in 1s...", err)
+			time.Sleep(time.Second)
+			continue
+		}
+
+		rawPayload := result[1]
+		w.Redis.ZAdd(ctx, processingSummary, redis.Z{
+			Score:  float64(time.Now().Unix()),
+			Member: rawPayload,
+		})
+
+		var payload models.SummaryPayload
+		if err := json.Unmarshal([]byte(rawPayload), &payload); err != nil {
+			log.Printf("ConsumeSummaryQueue: unmarshal error: %v, discarding message", err)
+			w.Redis.ZRem(ctx, processingSummary, rawPayload)
+			continue
+		}
+
+		go func(p models.SummaryPayload, raw string) {
+			taskCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			w.activeCancels.Store(p.TaskID, cancel)
+			defer w.activeCancels.Delete(p.TaskID)
+			w.handleSummary(taskCtx, p, raw)
+		}(payload, rawPayload)
 	}
+}
+
+// handleSTT 執行 STT 階段：音檔切片 → 並發轉錄（retry x3）→ mergeTranscripts → 儲存 transcript → 通知 stt_completed。
+func (w *Worker) handleSTT(ctx context.Context, payload models.STTPayload, rawPayload string) {
+	log.Printf("Processing STT task: %s", payload.TaskID)
+
+	w.Redis.HSet(ctx, "task:"+payload.TaskID, "status", models.StatusSttProcessing, "startedAt", fmt.Sprintf("%d", time.Now().Unix()))
 	w.notifyProgress(payload.TaskID, 10, "音檔處理中...")
 
 	// 1. 音檔切片（VAD 優先）
 	const defaultMaxChunkDuration = 30.0
 	chunks, err := audio.SplitAudio(payload.FilePath, defaultMaxChunkDuration)
 	if err != nil {
-		w.handleError(payload, err)
+		w.handleSTTError(ctx, payload, rawPayload, err)
 		return
 	}
 	defer audio.CleanupChunks(chunks)
 
 	w.notifyProgress(payload.TaskID, 30, fmt.Sprintf("語音轉譯中（%d 段）...", len(chunks)))
 
-	// 2. 併發轉錄（Goroutine + Semaphore = 2，降低本地 server 壓力）
+	// 2. 並發轉錄（Semaphore = 2，降低本地 GPU 壓力）
 	transcripts := make([]string, len(chunks))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 2)
@@ -141,7 +186,6 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 	var firstErr atomic.Value
 	var completedChunks int32
 
-	// 累進式推送狀態
 	var streamingMu sync.Mutex
 	nextToStream := 0
 	currentFullTranscript := ""
@@ -161,7 +205,6 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 			chunkCtx, chunkCancel := context.WithTimeout(sttCtx, 5*time.Minute)
 			defer chunkCancel()
 
-			// 實作簡單重試機制
 			var chunkTranscript string
 			var sttErr error
 			for attempt := 0; attempt < 3; attempt++ {
@@ -169,13 +212,12 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 				if sttErr == nil {
 					break
 				}
-				log.Printf("STT attempt %d failed for chunk %d: %v, retrying in 2s...", attempt+1, idx, sttErr)
+				log.Printf("STT attempt %d failed for chunk %d of task %s: %v, retrying in 2s...", attempt+1, idx, payload.TaskID, sttErr)
 				time.Sleep(2 * time.Second)
 			}
 
 			if sttErr != nil {
 				if firstErr.CompareAndSwap(nil, sttErr) {
-					// 發生錯誤，通知同組的其他 goroutine 取消
 					sttCancel()
 				}
 				return
@@ -185,16 +227,14 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 			completed := atomic.AddInt32(&completedChunks, 1)
 			w.notifyProgress(payload.TaskID, 30+int(completed)*40/len(chunks), "語音轉譯中...")
 
-			// 累進式順序推送文字給前端
+			// 累進式順序推送轉錄文字至前端
 			streamingMu.Lock()
 			if idx == nextToStream {
-				// 如果完成的是我們正在等待的下一個分片，就開始往後推
 				for nextToStream < len(chunks) && transcripts[nextToStream] != "" {
 					currentFullTranscript = mergeTranscripts(currentFullTranscript, transcripts[nextToStream])
 					nextToStream++
 				}
 				w.notifyTranscriptUpdate(payload.TaskID, currentFullTranscript)
-				// 更新 Redis快取，供 SSE 重連時恢復已產生的轉錄內容
 				w.Redis.Set(ctx, fmt.Sprintf("transcript:buffer:%s", payload.TaskID), currentFullTranscript, 10*time.Minute)
 			}
 			streamingMu.Unlock()
@@ -204,12 +244,12 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 	wg.Wait()
 
 	if storedErr := firstErr.Load(); storedErr != nil {
-		w.handleError(payload, storedErr.(error))
+		w.handleSTTError(ctx, payload, rawPayload, storedErr.(error))
 		return
 	}
 
 	if ctx.Err() != nil {
-		w.handleError(payload, ctx.Err())
+		w.handleSTTError(ctx, payload, rawPayload, ctx.Err())
 		return
 	}
 
@@ -222,160 +262,88 @@ func (w *Worker) handleSTT(ctx context.Context, payload models.TaskPayload) {
 		}
 	}
 
-	// 4. 原子存儲：將轉錄結果與 SUMMARY 任務 Outbox 事件綁定在同一個事務中
-	summaryPayload := models.TaskPayload{
-		TaskID:     payload.TaskID,
-		CreatorID:  payload.CreatorID,
-		Type:       "SUMMARY",
-		Transcript: fullTranscript,
-		Config:     payload.Config,
-	}
-
-	if err := db.SaveSTTResultsWithOutbox(w.DB, payload.TaskID, fullTranscript, summaryPayload); err != nil {
-		w.handleError(payload, fmt.Errorf("failed to save results and outbox event: %v", err))
+	// 4. 持久化：transcript 寫入 DB，tasks.status=stt_completed
+	if err := db.SaveTranscript(w.DB, payload.TaskID, fullTranscript); err != nil {
+		w.handleSTTError(ctx, payload, rawPayload, fmt.Errorf("SaveTranscript: %w", err))
 		return
 	}
 
-	w.notifyProgress(payload.TaskID, 75, "轉錄完成，已加入摘要排程...")
+	// 5. Redis 狀態更新：HSET stt_completed → ZREM → PUBLISH
+	w.Redis.HSet(ctx, "task:"+payload.TaskID, "status", models.StatusSttCompleted)
+	w.Redis.ZRem(ctx, processingSTT, rawPayload)
+	w.notifySTTCompleted(payload.TaskID)
+	w.notifyProgress(payload.TaskID, 75, "轉錄完成，等待觸發摘要...")
 	w.cleanup(payload.FilePath)
 }
 
-// handleSummary 執行 LLM 摘要階段：串流生成摘要，每個 chunk 即時推送 SSE 並更新 Redis buffer。
-func (w *Worker) handleSummary(ctx context.Context, payload models.TaskPayload) {
+// handleSummary 執行 LLM 摘要階段：串流生成摘要 → 每個 chunk 即時推送 SSE → 儲存 summary。
+func (w *Worker) handleSummary(ctx context.Context, payload models.SummaryPayload, rawPayload string) {
 	log.Printf("Processing Summary task: %s", payload.TaskID)
 
-	// Atomic Check: 確保任務處於 processing，防止因重送造成的多次 LLM 調用（冪等性）
-	if err := db.StartSummaryCheck(w.DB, payload.TaskID); err != nil {
-		log.Printf("Summary skipped for task %s (likely duplicated or already processed): %v", payload.TaskID, err)
-		return
-	}
-
+	w.Redis.HSet(ctx, "task:"+payload.TaskID, "status", models.StatusSummaryProcessing)
 	w.notifyProgress(payload.TaskID, 80, "摘要生成中...")
 
 	var summaryBuffer strings.Builder
 
-	err := w.LLM.SummarizeStream(ctx, payload.Transcript, "", func(chunk string) {
+	err := w.LLM.SummarizeStream(ctx, payload.Transcript, payload.Config.SummaryPrompt, func(chunk string) {
 		summaryBuffer.WriteString(chunk)
 		w.notifySummaryChunk(payload.TaskID, chunk)
-		// 更新 Redis buffer，供 SSE 重連時恢復已產生的摘要
 		w.Redis.Set(ctx, fmt.Sprintf("summary:buffer:%s", payload.TaskID), summaryBuffer.String(), 10*time.Minute)
 	})
 
 	if err != nil {
-		w.handleError(payload, err)
+		w.handleSummaryError(ctx, payload, rawPayload, err)
 		return
 	}
 
-	summary := summaryBuffer.String()
-
-	// 原子更新：processing → completed + 儲存 summary（Transaction）
-	if err := db.UpdateTaskStatus(w.DB, payload.TaskID, "completed", "", summary, ""); err != nil {
-		log.Printf("Failed to complete task %s: %v", payload.TaskID, err)
+	// 持久化：summary 寫入 DB，tasks.status=completed
+	if err := db.SaveSummary(w.DB, payload.TaskID, summaryBuffer.String()); err != nil {
+		w.handleSummaryError(ctx, payload, rawPayload, fmt.Errorf("SaveSummary: %w", err))
 		return
 	}
 
+	w.Redis.HSet(ctx, "task:"+payload.TaskID, "status", models.StatusCompleted)
+	w.Redis.ZRem(ctx, processingSummary, rawPayload)
 	w.notifyCompleted(payload.TaskID)
 }
 
-// StartOutboxRelay 啟動背景協程，定期掃描並發布 Outbox 事件。
-func (w *Worker) StartOutboxRelay(ctx context.Context) {
-	log.Println("Outbox relay started")
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Outbox relay stopped")
-			return
-		case <-ticker.C:
-			w.processOutbox()
-		}
+// handleSTTError 統一 STT 錯誤處理：區分 Canceled（用戶取消）與其他錯誤，清理音檔。
+func (w *Worker) handleSTTError(ctx context.Context, payload models.STTPayload, rawPayload string, err error) {
+	eventType := models.StatusFailed
+	if errors.Is(err, context.Canceled) {
+		eventType = models.StatusCancelled
+		log.Printf("STT task %s cancelled", payload.TaskID)
+	} else {
+		log.Printf("STT task %s failed: %v", payload.TaskID, err)
 	}
+	if dbErr := db.SetTaskStatus(w.DB, payload.TaskID, eventType, err.Error()); dbErr != nil {
+		log.Printf("STT task %s: failed to persist terminal status: %v", payload.TaskID, dbErr)
+	}
+	w.Redis.HSet(ctx, "task:"+payload.TaskID, "status", eventType)
+	w.Redis.ZRem(ctx, processingSTT, rawPayload)
+	w.notifyEvent(payload.TaskID, eventType, err.Error())
+	w.cleanup(payload.FilePath)
 }
 
-// StartReaper 啟動定時清理器，回收超時的「Processing」任務（Reaper Pattern）。
-// 透過 Redis 分散式鎖 (Leader Election) 確保叢集中只有單一 Worker 執行清理，避免 DB 競爭。
-func (w *Worker) StartReaper(ctx context.Context) {
-	log.Println("Reaper started (with Leader Election mechanism)")
-	ticker := time.NewTicker(10 * time.Minute)
-	defer ticker.Stop()
-
-	lockKey := "worker:reaper:lock"
-	lockTTL := 2 * time.Minute // 鎖持有時間必須小於 Ticker 週期，確保下一輪重新選舉順利
-
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Reaper stopped")
-			return
-		case <-ticker.C:
-			// 1. 透過 SetNX (SET if Not eXists) 嘗試取得全域鎖，競爭成為 Leader
-			acquired, err := w.Redis.SetNX(ctx, lockKey, "locked", lockTTL).Result()
-			if err != nil {
-				log.Printf("Reaper: failed to acquire leader lock: %v", err)
-				continue
-			}
-
-			// 2. 若未取得鎖，身為 Follower 直接略過（不記 Log 避免多節點刷頻），讓 Leader 執行即可
-			if !acquired {
-				continue
-			}
-
-			// 3. 成功奪魁，以 Leader 身分執行全表掃描與狀態清理
-			count, err := db.CleanTimedOutTasks(w.DB, 30) // 清除 30 分鐘超時未完成的任務
-			if err != nil {
-				log.Printf("Reaper (Leader): failed to clean tasks: %v", err)
-			} else if count > 0 {
-				log.Printf("Reaper (Leader): cleaned up %d timed out tasks", count)
-			}
-		}
+// handleSummaryError 統一 Summary 錯誤處理。
+func (w *Worker) handleSummaryError(ctx context.Context, payload models.SummaryPayload, rawPayload string, err error) {
+	eventType := models.StatusFailed
+	if errors.Is(err, context.Canceled) {
+		eventType = models.StatusCancelled
+		log.Printf("Summary task %s cancelled", payload.TaskID)
+	} else {
+		log.Printf("Summary task %s failed: %v", payload.TaskID, err)
 	}
-}
-
-// processOutbox 執行單次 Outbox 掃描與發布。
-func (w *Worker) processOutbox() {
-	err := db.ProcessOutboxEvents(w.DB, 10, func(event models.OutboxEvent) error {
-		var payload models.TaskPayload
-		if err := json.Unmarshal(event.Payload, &payload); err != nil {
-			log.Printf("Relay: failed to unmarshal event %s: %v", event.ID, err)
-			return err
-		}
-
-		if err := w.publishTask(payload); err != nil {
-			log.Printf("Relay: failed to publish event %s: %v", event.ID, err)
-			return err
-		}
-
-		log.Printf("Relay: successfully published event %s (Task: %s)", event.ID, payload.TaskID)
-		return nil
-	})
-
-	if err != nil && err != sql.ErrNoRows {
-		log.Printf("Relay: failed to process outbox events: %v", err)
+	if dbErr := db.SetTaskStatus(w.DB, payload.TaskID, eventType, err.Error()); dbErr != nil {
+		log.Printf("Summary task %s: failed to persist terminal status: %v", payload.TaskID, dbErr)
 	}
-}
-
-// publishTask 將任務訊息發布回 RabbitMQ tasks 佇列。
-// 使用獨立的 publishCh 與 mutex 確保執行緒安全。
-func (w *Worker) publishTask(payload models.TaskPayload) error {
-	w.publishMu.Lock()
-	defer w.publishMu.Unlock()
-
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	return w.publishCh.Publish("", "tasks", false, false, amqp.Publishing{
-		ContentType:  "application/json",
-		Body:         body,
-		DeliveryMode: amqp.Persistent,
-	})
+	w.Redis.HSet(ctx, "task:"+payload.TaskID, "status", eventType)
+	w.Redis.ZRem(ctx, processingSummary, rawPayload)
+	w.notifyEvent(payload.TaskID, eventType, err.Error())
 }
 
 // --- SSE 事件輔助函式 ---
 
-// notifyProgress 發布進度更新事件至 Redis Pub/Sub。
 func (w *Worker) notifyProgress(taskID string, progress int, msg string) {
 	event := models.SSEEvent{
 		TaskID:   taskID,
@@ -387,7 +355,15 @@ func (w *Worker) notifyProgress(taskID string, progress int, msg string) {
 	rdb_lib.PublishProgress(w.Redis, context.Background(), taskID, event)
 }
 
-// notifySummaryChunk 發布摘要片段事件，前端收到後即時渲染。
+func (w *Worker) notifySTTCompleted(taskID string) {
+	event := models.SSEEvent{
+		TaskID: taskID,
+		Type:   "stt_completed",
+		Status: "stt_completed",
+	}
+	rdb_lib.PublishProgress(w.Redis, context.Background(), taskID, event)
+}
+
 func (w *Worker) notifySummaryChunk(taskID, content string) {
 	event := models.SSEEvent{
 		TaskID:  taskID,
@@ -397,7 +373,6 @@ func (w *Worker) notifySummaryChunk(taskID, content string) {
 	rdb_lib.PublishProgress(w.Redis, context.Background(), taskID, event)
 }
 
-// notifyCompleted 發布任務完成事件。
 func (w *Worker) notifyCompleted(taskID string) {
 	event := models.SSEEvent{
 		TaskID: taskID,
@@ -406,7 +381,6 @@ func (w *Worker) notifyCompleted(taskID string) {
 	rdb_lib.PublishProgress(w.Redis, context.Background(), taskID, event)
 }
 
-// notifyTranscriptUpdate 發布累進式的轉錄結果，前端收到後直接替換顯示內容。
 func (w *Worker) notifyTranscriptUpdate(taskID, content string) {
 	event := models.SSEEvent{
 		TaskID:  taskID,
@@ -416,7 +390,6 @@ func (w *Worker) notifyTranscriptUpdate(taskID, content string) {
 	rdb_lib.PublishProgress(w.Redis, context.Background(), taskID, event)
 }
 
-// notifyEvent 發布通用事件（如 failed、cancelled）。
 func (w *Worker) notifyEvent(taskID, eventType, msg string) {
 	event := models.SSEEvent{
 		TaskID:  taskID,
@@ -427,26 +400,7 @@ func (w *Worker) notifyEvent(taskID, eventType, msg string) {
 	rdb_lib.PublishProgress(w.Redis, context.Background(), taskID, event)
 }
 
-// handleError 統一錯誤處理：區分 context.Canceled（用戶取消）與其他錯誤。
-// 更新 DB 狀態、發布 SSE 事件，STT 階段額外清理音檔。
-func (w *Worker) handleError(payload models.TaskPayload, err error) {
-	eventType := "failed"
-	if err == context.Canceled {
-		eventType = "cancelled"
-		log.Printf("Task %s cancelled", payload.TaskID)
-	} else {
-		log.Printf("Task %s failed: %v", payload.TaskID, err)
-	}
-
-	db.UpdateTaskStatus(w.DB, payload.TaskID, eventType, "", "", err.Error())
-	w.notifyEvent(payload.TaskID, eventType, err.Error())
-
-	if payload.Type == "STT" {
-		w.cleanup(payload.FilePath)
-	}
-}
-
-// mergeTranscripts 智能合併兩段具有重疊可能的文字。
+// mergeTranscripts 智能合併兩段具有重疊可能的文字（最多 10 個 token 窗口）。
 func mergeTranscripts(t1, t2 string) string {
 	t1 = strings.TrimSpace(t1)
 	t2 = strings.TrimSpace(t2)
@@ -460,7 +414,6 @@ func mergeTranscripts(t1, t2 string) string {
 	w1 := strings.Fields(t1)
 	w2 := strings.Fields(t2)
 
-	// 設定最大比對窗口（例如 10 個單詞，足以涵蓋 1.5s 的重疊）
 	maxMatch := 10
 	if len(w1) < maxMatch {
 		maxMatch = len(w1)
@@ -471,7 +424,6 @@ func mergeTranscripts(t1, t2 string) string {
 
 	bestMatchLen := 0
 	for i := 1; i <= maxMatch; i++ {
-		// 取 t1 最後 i 個單詞與 t2 最前 i 個單詞比較
 		match := true
 		for j := 0; j < i; j++ {
 			if w1[len(w1)-i+j] != w2[j] {
@@ -484,7 +436,6 @@ func mergeTranscripts(t1, t2 string) string {
 		}
 	}
 
-	// 合併：t1 + t2(去掉重複部分)
 	remainingW2 := w2[bestMatchLen:]
 	if len(remainingW2) == 0 {
 		return t1

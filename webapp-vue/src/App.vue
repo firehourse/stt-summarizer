@@ -17,6 +17,8 @@ const currentTask = ref(null);
 const eventSource = ref(null);
 const uploadProgress = ref(0);
 const isUploading = ref(false);
+const sttCompleted = ref(false);
+const customPrompt = ref("");
 
 const handleDrop = (e) => {
   isDragging.value = false;
@@ -61,9 +63,10 @@ const uploadFile = async (file) => {
       },
     });
 
-    currentTask.value.status = "processing";
-    currentTask.value.message = "上傳完成，開始處理...";
+    currentTask.value.status = "stt_processing";
+    currentTask.value.message = "上傳完成，開始語音轉譯...";
     isUploading.value = false;
+    sttCompleted.value = false;
 
     startListening(taskId);
   } catch (err) {
@@ -84,7 +87,14 @@ const startListening = (taskId) => {
   eventSource.value.onmessage = async (event) => {
     const data = JSON.parse(event.data);
 
-    if (data.type === "summary_chunk") {
+    if (data.type === "stt_completed") {
+      // STT 完成，等待使用者手動觸發摘要
+      currentTask.value.status = "stt_completed";
+      currentTask.value.message = "轉錄完成，請點擊「開始摘要」繼續";
+      currentTask.value.progress = 75;
+      sttCompleted.value = true;
+      eventSource.value.close();
+    } else if (data.type === "summary_chunk") {
       // 摘要是增量推送 (Chunk-based)
       currentTask.value.summary =
         (currentTask.value.summary || "") + data.content;
@@ -115,7 +125,7 @@ const startListening = (taskId) => {
       eventSource.value.close();
     } else {
       // progress event
-      currentTask.value.status = data.status || "processing";
+      currentTask.value.status = data.status || "stt_processing";
       currentTask.value.progress = data.progress || 0;
       currentTask.value.message = data.message || "";
     }
@@ -126,9 +136,28 @@ const startListening = (taskId) => {
   };
 };
 
+// STT 完成後使用者按「開始摘要」觸發
+const requestSummarize = async () => {
+  if (!currentTask.value) return;
+  currentTask.value.status = "summary_processing";
+  currentTask.value.summary = "";
+  currentTask.value.message = "摘要生成中...";
+  sttCompleted.value = false;
+
+  try {
+    await axios.post(`/api/tasks/${currentTask.value.id}/summarize`, {
+      prompt: customPrompt.value || undefined,
+    });
+    startListening(currentTask.value.id);
+  } catch (err) {
+    currentTask.value.status = "failed";
+    currentTask.value.message = "Failed to request summary: " + err.message;
+  }
+};
+
 const requestResummarize = async () => {
   if (!currentTask.value) return;
-  currentTask.value.status = "processing";
+  currentTask.value.status = "summary_processing";
   currentTask.value.summary = "";
   currentTask.value.message = "重新摘要中...";
 
@@ -280,10 +309,10 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <!-- Streaming Results (visible during processing) -->
+          <!-- Streaming Results (visible during STT or Summary processing) -->
           <div
             v-if="
-              currentTask?.status === 'processing' &&
+              ['stt_processing', 'summary_processing'].includes(currentTask?.status) &&
               (currentTask?.transcript || currentTask?.summary)
             "
             class="mt-8 space-y-6 animate-in"
@@ -316,6 +345,36 @@ onUnmounted(() => {
                 {{ currentTask.summary }}<span class="animate-pulse">▊</span>
               </div>
             </div>
+          </div>
+
+          <!-- STT Completed — 等待使用者觸發摘要 -->
+          <div
+            v-if="sttCompleted"
+            class="mt-8 space-y-6 animate-in"
+          >
+            <div v-if="currentTask?.transcript" class="space-y-3">
+              <h4 class="text-sm font-bold text-slate-500 uppercase flex items-center gap-2">
+                <CheckCircle class="w-4 h-4" /> 轉錄結果
+              </h4>
+              <div class="bg-slate-900/50 rounded-2xl p-6 border border-slate-700/30 text-slate-300 leading-relaxed max-h-60 overflow-y-auto">
+                {{ currentTask.transcript }}
+              </div>
+            </div>
+            <div class="space-y-3">
+              <label class="text-sm font-medium text-slate-400">自訂摘要提示（選填）</label>
+              <input
+                v-model="customPrompt"
+                type="text"
+                placeholder="例：請以條列式整理重點..."
+                class="w-full bg-slate-900/50 border border-slate-700/30 rounded-xl px-4 py-2 text-slate-200 placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+            <button
+              @click="requestSummarize"
+              class="w-full py-3 px-6 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-2xl transition-colors"
+            >
+              開始摘要
+            </button>
           </div>
 
           <!-- Final Results -->
